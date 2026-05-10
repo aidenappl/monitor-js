@@ -1,18 +1,5 @@
 import type { Monitor } from "./client";
-
-interface AxiosResponse {
-    status: number;
-    headers: Record<string, string>;
-    config: { method?: string; url?: string };
-    data?: { error_message?: string; error?: string };
-}
-
-interface AxiosError {
-    response?: AxiosResponse;
-    config?: { method?: string; url?: string; metadata?: { startTime?: number } };
-    code?: string;
-    message?: string;
-}
+import type { LogLevel } from "./types";
 
 interface AxiosInstance {
     interceptors: {
@@ -35,6 +22,9 @@ export interface AxiosMonitorOptions {
 /**
  * Attaches Monitor interceptors to an Axios instance.
  * Automatically reports API failures with request_id correlation.
+ *
+ * Works with both standard axios error handling AND `validateStatus: () => true`
+ * (where all HTTP responses go through the fulfilled handler).
  */
 export function attachAxiosMonitor(
     axiosInstance: AxiosInstance,
@@ -53,45 +43,65 @@ export function attachAxiosMonitor(
 
     axiosInstance.interceptors.response.use(
         (response: any) => {
-            if (!reportSuccess) return response;
-
-            const url = response.config?.url ?? "";
+            const url: string = response.config?.url ?? "";
             if (ignorePaths.some((p) => url.includes(p))) return response;
 
+            const statusCode: number = response.status ?? 0;
+            const requestId: string = response.headers?.["x-request-id"] ?? "";
             const durationMs = response.config?.metadata?.startTime
                 ? Date.now() - response.config.metadata.startTime
                 : undefined;
 
-            const requestId = response.headers?.["x-request-id"] ?? "";
+            // Handle error responses that come through fulfilled handler
+            // (when validateStatus: () => true is used)
+            if (statusCode >= minStatus) {
+                const level: LogLevel = statusCode >= 500 ? "error" : "warn";
+                const name =
+                    statusCode >= 500 ? "api.request.server_error" : "api.request.client_error";
 
-            monitor.info("api.request.success", {
-                requestId,
-                data: {
-                    method: (response.config?.method ?? "").toUpperCase(),
-                    url,
-                    status_code: response.status,
-                    duration_ms: durationMs,
-                },
-            });
+                monitor.emit(name, level, {
+                    requestId,
+                    data: {
+                        method: (response.config?.method ?? "").toUpperCase(),
+                        url,
+                        status_code: statusCode,
+                        error: response.data?.error,
+                        error_message: response.data?.error_message,
+                        duration_ms: durationMs,
+                    },
+                });
+
+                return response;
+            }
+
+            // Report successful requests if enabled
+            if (reportSuccess && statusCode > 0) {
+                monitor.info("api.request.success", {
+                    requestId,
+                    data: {
+                        method: (response.config?.method ?? "").toUpperCase(),
+                        url,
+                        status_code: statusCode,
+                        duration_ms: durationMs,
+                    },
+                });
+            }
 
             return response;
         },
-        (error: AxiosError) => {
-            const url = error.config?.url ?? "";
+        (error: any) => {
+            const url: string = error.config?.url ?? "";
             if (ignorePaths.some((p) => url.includes(p))) {
                 return Promise.reject(error);
             }
 
-            const statusCode = error.response?.status ?? 0;
-            const requestId = error.response?.headers?.["x-request-id"] ?? "";
             const durationMs = error.config?.metadata?.startTime
                 ? Date.now() - error.config.metadata.startTime
                 : undefined;
 
-            // Network errors (no response at all)
+            // Network errors (no response — timeout, DNS failure, CORS blocked)
             if (!error.response) {
                 monitor.error("api.request.network_error", {
-                    requestId,
                     data: {
                         method: (error.config?.method ?? "").toUpperCase(),
                         url,
@@ -103,13 +113,16 @@ export function attachAxiosMonitor(
                 return Promise.reject(error);
             }
 
-            // HTTP errors
+            // HTTP errors (when validateStatus is default — throws on non-2xx)
+            const statusCode: number = error.response.status ?? 0;
+            const requestId: string = error.response.headers?.["x-request-id"] ?? "";
+
             if (statusCode >= minStatus) {
-                const level = statusCode >= 500 ? "error" : "warn";
+                const level: LogLevel = statusCode >= 500 ? "error" : "warn";
                 const name =
                     statusCode >= 500 ? "api.request.server_error" : "api.request.client_error";
 
-                monitor.emit(name, level as any, {
+                monitor.emit(name, level, {
                     requestId,
                     data: {
                         method: (error.config?.method ?? "").toUpperCase(),

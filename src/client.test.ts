@@ -14,7 +14,7 @@ describe("Monitor", () => {
             ingestUrl: "http://localhost:8030/v1/events",
             apiKey: "test-key",
             env: "test",
-            flushInterval: 60000, // don't auto-flush during tests
+            flushInterval: 60000,
             batchSize: 100,
             captureErrors: false,
             captureUnhandledRejections: false,
@@ -30,7 +30,7 @@ describe("Monitor", () => {
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it("flushes events as NDJSON", () => {
+    it("flushes events as NDJSON with correct headers", () => {
         monitor.info("event.one", { data: { a: 1 } });
         monitor.error("event.two", { data: { b: 2 } });
         monitor.flush();
@@ -40,6 +40,7 @@ describe("Monitor", () => {
         expect(url).toBe("http://localhost:8030/v1/events");
         expect(opts.headers["X-Api-Key"]).toBe("test-key");
         expect(opts.headers["Content-Type"]).toBe("application/x-ndjson");
+        expect(opts.keepalive).toBe(true);
 
         const lines = (opts.body as string).split("\n");
         expect(lines).toHaveLength(2);
@@ -105,7 +106,7 @@ describe("Monitor", () => {
         small.info("one");
         small.info("two");
         expect(mockFetch).not.toHaveBeenCalled();
-        small.info("three"); // triggers flush
+        small.info("three");
         expect(mockFetch).toHaveBeenCalledTimes(1);
         small.shutdown();
     });
@@ -115,14 +116,13 @@ describe("Monitor", () => {
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it("sets correct timestamp format", () => {
+    it("sets correct ISO 8601 timestamp", () => {
         monitor.info("test.time");
         monitor.flush();
 
         const body = mockFetch.mock.calls[0][1].body as string;
         const event = JSON.parse(body);
-        // ISO 8601 format
-        expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+        expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     });
 
     it("supports all log levels", () => {
@@ -139,5 +139,55 @@ describe("Monitor", () => {
         expect(JSON.parse(lines[2]).level).toBe("warn");
         expect(JSON.parse(lines[3]).level).toBe("error");
         expect(JSON.parse(lines[4]).level).toBe("fatal");
+    });
+
+    it("drops events silently after shutdown", () => {
+        monitor.shutdown();
+        mockFetch.mockClear();
+        monitor.info("should.be.dropped");
+        monitor.flush();
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("caps queue at MAX_QUEUE_SIZE to prevent memory leaks", () => {
+        const small = new Monitor({
+            service: "test",
+            ingestUrl: "http://localhost/v1/events",
+            apiKey: "key",
+            batchSize: 10000, // never auto-flush
+            flushInterval: 60000,
+            captureErrors: false,
+            captureUnhandledRejections: false,
+        });
+
+        for (let i = 0; i < 600; i++) {
+            small.emit("flood.event", "info", { data: { i } });
+        }
+        small.flush();
+
+        const body = mockFetch.mock.calls[0][1].body as string;
+        const lines = body.split("\n");
+        expect(lines.length).toBeLessThanOrEqual(500);
+        small.shutdown();
+    });
+
+    it("persists job_id across events via setJobId", () => {
+        monitor.setJobId("job-uuid-123");
+        monitor.info("event.one");
+        monitor.flush();
+
+        const body = mockFetch.mock.calls[0][1].body as string;
+        const event = JSON.parse(body);
+        expect(event.job_id).toBe("job-uuid-123");
+    });
+
+    it("allows per-event userId override", () => {
+        monitor.setUser("global-user");
+        monitor.info("override.event", { userId: "specific-user" });
+        monitor.flush();
+
+        const body = mockFetch.mock.calls[0][1].body as string;
+        const event = JSON.parse(body);
+        expect(event.user_id).toBe("specific-user");
     });
 });

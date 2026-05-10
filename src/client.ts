@@ -2,6 +2,7 @@ import type { MonitorConfig, MonitorEvent, EmitOptions, LogLevel } from "./types
 
 const DEFAULT_FLUSH_INTERVAL = 2000;
 const DEFAULT_BATCH_SIZE = 20;
+const MAX_QUEUE_SIZE = 500;
 
 export class Monitor {
     private config: Required<
@@ -11,7 +12,7 @@ export class Monitor {
     private timer: ReturnType<typeof setInterval> | null = null;
     private userId: string = "";
     private jobId: string = "";
-    private started = false;
+    private active = false;
 
     constructor(config: MonitorConfig) {
         this.config = {
@@ -51,6 +52,8 @@ export class Monitor {
 
     /** Emit an event at a specific level */
     emit(name: string, level: LogLevel, opts?: EmitOptions): void {
+        if (!this.active) return;
+
         const event: MonitorEvent = {
             timestamp: new Date().toISOString(),
             service: this.config.service,
@@ -63,6 +66,11 @@ export class Monitor {
             level,
             data: opts?.data ?? {},
         };
+
+        if (this.queue.length >= MAX_QUEUE_SIZE) {
+            // Drop oldest events to prevent unbounded memory growth
+            this.queue.shift();
+        }
 
         this.queue.push(event);
 
@@ -107,25 +115,8 @@ export class Monitor {
         const batch = this.queue.splice(0);
         const payload = batch.map((e) => JSON.stringify(e)).join("\n");
 
-        // Use sendBeacon if available and document is hidden (page unload scenario)
-        if (
-            typeof navigator !== "undefined" &&
-            navigator.sendBeacon &&
-            typeof document !== "undefined" &&
-            document.visibilityState === "hidden"
-        ) {
-            const blob = new Blob([payload], { type: "application/x-ndjson" });
-            const sent = navigator.sendBeacon(
-                `${this.config.ingestUrl}?key=${this.config.apiKey}`,
-                blob
-            );
-            if (!sent && this.config.debug) {
-                console.warn("[monitor] sendBeacon failed, events may be lost");
-            }
-            return;
-        }
+        if (typeof fetch === "undefined") return;
 
-        // Standard fetch for normal operation
         fetch(this.config.ingestUrl, {
             method: "POST",
             headers: {
@@ -138,9 +129,9 @@ export class Monitor {
             if (this.config.debug) {
                 console.warn("[monitor] flush failed:", err);
             }
-            // Re-queue failed events (cap at 200 to prevent memory leak)
-            if (this.queue.length < 200) {
-                this.queue.unshift(...batch);
+            // Re-queue failed events if there's room
+            if (this.queue.length + batch.length <= MAX_QUEUE_SIZE) {
+                this.queue = batch.concat(this.queue);
             }
         });
     }
@@ -153,16 +144,15 @@ export class Monitor {
         }
         this.flush();
         this.removeListeners();
-        this.started = false;
+        this.active = false;
     }
 
     private start(): void {
-        if (this.started) return;
-        this.started = true;
+        if (this.active) return;
+        this.active = true;
 
         this.timer = setInterval(() => this.flush(), this.config.flushInterval);
 
-        // Flush on page hide (covers tab close, navigation, mobile background)
         if (typeof document !== "undefined") {
             document.addEventListener("visibilitychange", this.handleVisibilityChange);
         }
