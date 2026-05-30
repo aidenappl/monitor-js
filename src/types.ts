@@ -19,6 +19,14 @@ export interface MonitorConfig {
     captureUnhandledRejections?: boolean;
     /** Enable debug logging to console (default: false) */
     debug?: boolean;
+    /**
+     * Patterns (strings or RegExp) matched against captured error messages and
+     * stack traces. Matching errors are silently dropped before reaching the
+     * ingest queue. Use to filter browser-extension noise, third-party script
+     * errors, or other non-actionable events. Applies to both `client.error.uncaught`
+     * and `client.error.unhandled_rejection`. Default: [] (no filtering).
+     */
+    ignoreErrors?: (string | RegExp)[];
 }
 
 export interface MonitorEvent {

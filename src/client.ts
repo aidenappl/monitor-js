@@ -8,6 +8,7 @@ export class Monitor {
     private config: Required<
         Pick<MonitorConfig, "service" | "ingestUrl" | "apiKey" | "env" | "flushInterval" | "batchSize" | "debug">
     >;
+    private ignoreErrors: (string | RegExp)[] = [];
     private queue: MonitorEvent[] = [];
     private timer: ReturnType<typeof setInterval> | null = null;
     private userId: string = "";
@@ -24,6 +25,7 @@ export class Monitor {
             batchSize: config.batchSize ?? DEFAULT_BATCH_SIZE,
             debug: config.debug ?? false,
         };
+        this.ignoreErrors = config.ignoreErrors ?? [];
 
         this.start();
 
@@ -171,24 +173,45 @@ export class Monitor {
         this.flush();
     };
 
+    private shouldIgnoreError(message: string, stack?: string): boolean {
+        if (this.ignoreErrors.length === 0) return false;
+        for (const pattern of this.ignoreErrors) {
+            if (typeof pattern === "string") {
+                if (message.includes(pattern) || (stack !== undefined && stack.includes(pattern))) {
+                    return true;
+                }
+            } else {
+                if (pattern.test(message) || (stack !== undefined && pattern.test(stack))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private errorHandler = (event: ErrorEvent): void => {
+        const stack = event.error?.stack;
+        if (this.shouldIgnoreError(event.message ?? "", stack)) return;
         this.emit("client.error.uncaught", "error", {
             data: {
                 message: event.message,
                 filename: event.filename,
                 lineno: event.lineno,
                 colno: event.colno,
-                stack: event.error?.stack,
+                stack,
             },
         });
     };
 
     private rejectionHandler = (event: PromiseRejectionEvent): void => {
         const reason = event.reason;
+        const message = reason?.message ?? String(reason);
+        const stack = reason?.stack;
+        if (this.shouldIgnoreError(message, stack)) return;
         this.emit("client.error.unhandled_rejection", "error", {
             data: {
-                message: reason?.message ?? String(reason),
-                stack: reason?.stack,
+                message,
+                stack,
             },
         });
     };

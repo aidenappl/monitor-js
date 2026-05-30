@@ -190,4 +190,118 @@ describe("Monitor", () => {
         const event = JSON.parse(body);
         expect(event.user_id).toBe("specific-user");
     });
+
+    describe("ignoreErrors", () => {
+        it("drops uncaught errors matching a string pattern", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+                ignoreErrors: ["opts is not defined"],
+            });
+
+            (m as any).errorHandler({
+                message: "Uncaught ReferenceError: opts is not defined",
+                filename: "",
+                lineno: 10,
+                colno: 42,
+                error: { stack: "ReferenceError: opts is not defined\n at ..." },
+            });
+            (m as any).errorHandler({
+                message: "Some real error we care about",
+                filename: "app.js",
+                lineno: 1,
+                colno: 1,
+                error: { stack: "Error: real\n at ..." },
+            });
+            m.flush();
+
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            const body = mockFetch.mock.calls[0][1].body as string;
+            const events = body.split("\n").map((l) => JSON.parse(l));
+            expect(events).toHaveLength(1);
+            expect(events[0].data.message).toBe("Some real error we care about");
+            m.shutdown();
+        });
+
+        it("drops unhandled rejections matching a RegExp pattern", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+                ignoreErrors: [/Cannot read properties of undefined \(reading 'getInitialProps'\)/],
+            });
+
+            (m as any).rejectionHandler({
+                reason: { message: "Cannot read properties of undefined (reading 'getInitialProps')", stack: "TypeError: ..." },
+            });
+            (m as any).rejectionHandler({
+                reason: { message: "Network timeout", stack: "Error: timeout\n at ..." },
+            });
+            m.flush();
+
+            const body = mockFetch.mock.calls[0][1].body as string;
+            const events = body.split("\n").map((l) => JSON.parse(l));
+            expect(events).toHaveLength(1);
+            expect(events[0].data.message).toBe("Network timeout");
+            m.shutdown();
+        });
+
+        it("matches patterns against the stack trace as well as the message", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+                ignoreErrors: [/cloudflareinsights\.com/],
+            });
+
+            (m as any).errorHandler({
+                message: "Some generic message",
+                filename: "",
+                lineno: 1,
+                colno: 1,
+                error: { stack: "at https://static.cloudflareinsights.com/beacon.min.js/...:1:1" },
+            });
+            m.flush();
+
+            expect(mockFetch).not.toHaveBeenCalled();
+            m.shutdown();
+        });
+
+        it("captures all errors when ignoreErrors is empty", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+            });
+
+            (m as any).errorHandler({
+                message: "Anything",
+                filename: "",
+                lineno: 1,
+                colno: 1,
+                error: { stack: "..." },
+            });
+            m.flush();
+
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            m.shutdown();
+        });
+    });
 });
