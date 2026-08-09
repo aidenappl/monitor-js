@@ -1,5 +1,15 @@
 import type { MonitorConfig, MonitorEvent, EmitOptions, LogLevel } from "./types";
 
+// Minimal ambient shape for the Node `process` global — this package has no
+// @types/node dependency and targets the browser too, so `process` may be absent.
+// Guarded with `typeof process !== "undefined"` before use.
+declare const process:
+    | {
+          on?(event: string, listener: (...args: unknown[]) => void): void;
+          removeListener?(event: string, listener: (...args: unknown[]) => void): void;
+      }
+    | undefined;
+
 const DEFAULT_FLUSH_INTERVAL = 2000;
 const DEFAULT_BATCH_SIZE = 20;
 const MAX_QUEUE_SIZE = 500;
@@ -114,10 +124,12 @@ export class Monitor {
     flush(): void {
         if (this.queue.length === 0) return;
 
+        // Check for global fetch BEFORE removing events from the queue — otherwise
+        // on a runtime without fetch (Node <18) the batch would be dropped and lost.
+        if (typeof fetch === "undefined") return;
+
         const batch = this.queue.splice(0);
         const payload = batch.map((e) => JSON.stringify(e)).join("\n");
-
-        if (typeof fetch === "undefined") return;
 
         fetch(this.config.ingestUrl, {
             method: "POST",
@@ -153,7 +165,11 @@ export class Monitor {
         if (this.active) return;
         this.active = true;
 
-        this.timer = setInterval(() => this.flush(), this.config.flushInterval);
+        const t = setInterval(() => this.flush(), this.config.flushInterval);
+        // In Node, unref() lets the process exit even while the flush timer is pending.
+        // Browser timers have no unref(), so guard on its presence.
+        if (typeof (t as any).unref === "function") (t as any).unref();
+        this.timer = t;
 
         if (typeof document !== "undefined") {
             document.addEventListener("visibilitychange", this.handleVisibilityChange);
@@ -189,6 +205,21 @@ export class Monitor {
         return false;
     }
 
+    /**
+     * The route a browser error happened on.
+     *
+     * Deliberately `pathname` only — never the search string or hash. Query
+     * parameters routinely carry tokens, emails and other personal data, and this
+     * value is both stored on the event and folded into the server-side issue
+     * fingerprint, so anything included here is retained and grouped on.
+     *
+     * Returns undefined outside a browser so the Node handlers stay unaffected.
+     */
+    private currentPath(): string | undefined {
+        if (typeof window === "undefined" || !window.location) return undefined;
+        return window.location.pathname;
+    }
+
     private errorHandler = (event: ErrorEvent): void => {
         const stack = event.error?.stack;
         if (this.shouldIgnoreError(event.message ?? "", stack)) return;
@@ -199,6 +230,7 @@ export class Monitor {
                 lineno: event.lineno,
                 colno: event.colno,
                 stack,
+                path: this.currentPath(),
             },
         });
     };
@@ -212,6 +244,38 @@ export class Monitor {
             data: {
                 message,
                 stack,
+                path: this.currentPath(),
+            },
+        });
+    };
+
+    // --- Node process handlers ---
+    // uncaughtException/unhandledRejection are non-terminating here: we report the
+    // error and return without calling process.exit, matching the browser handlers'
+    // non-terminating behavior. Consumers keep their own crash semantics.
+
+    private nodeExceptionHandler = (err: unknown): void => {
+        const e = err as { message?: string; stack?: string } | undefined;
+        const message = e?.message ?? String(err);
+        const stack = e?.stack;
+        if (this.shouldIgnoreError(message, stack)) return;
+        this.emit("client.error.uncaught", "error", {
+            data: {
+                message,
+                stack,
+            },
+        });
+    };
+
+    private nodeRejectionHandler = (reason: unknown): void => {
+        const r = reason as { message?: string; stack?: string } | undefined;
+        const message = r?.message ?? String(reason);
+        const stack = r?.stack;
+        if (this.shouldIgnoreError(message, stack)) return;
+        this.emit("client.error.unhandled_rejection", "error", {
+            data: {
+                message,
+                stack,
             },
         });
     };
@@ -219,12 +283,16 @@ export class Monitor {
     private installErrorHandler(): void {
         if (typeof window !== "undefined") {
             window.addEventListener("error", this.errorHandler);
+        } else if (typeof process !== "undefined" && typeof process.on === "function") {
+            process.on("uncaughtException", this.nodeExceptionHandler);
         }
     }
 
     private installRejectionHandler(): void {
         if (typeof window !== "undefined") {
             window.addEventListener("unhandledrejection", this.rejectionHandler);
+        } else if (typeof process !== "undefined" && typeof process.on === "function") {
+            process.on("unhandledRejection", this.nodeRejectionHandler);
         }
     }
 
@@ -236,6 +304,10 @@ export class Monitor {
         }
         if (typeof document !== "undefined") {
             document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+        }
+        if (typeof process !== "undefined" && typeof process.removeListener === "function") {
+            process.removeListener("uncaughtException", this.nodeExceptionHandler);
+            process.removeListener("unhandledRejection", this.nodeRejectionHandler);
         }
     }
 }
