@@ -191,6 +191,130 @@ describe("Monitor", () => {
         expect(event.user_id).toBe("specific-user");
     });
 
+    it("does not drop the queue when global fetch is undefined", () => {
+        const savedFetch = globalThis.fetch;
+        // Simulate a runtime without global fetch (e.g. Node <18).
+        (globalThis as any).fetch = undefined;
+        try {
+            monitor.info("event.one", { data: { a: 1 } });
+            monitor.info("event.two", { data: { b: 2 } });
+            monitor.flush();
+            // Events must be retained since there is nothing to ship them with.
+            expect((monitor as any).queue).toHaveLength(2);
+        } finally {
+            (globalThis as any).fetch = savedFetch;
+        }
+        // Once fetch is back, the retained events flush successfully.
+        monitor.flush();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const lines = (mockFetch.mock.calls[0][1].body as string).split("\n");
+        expect(lines).toHaveLength(2);
+    });
+
+    describe("Node process handlers", () => {
+        it("captures uncaughtException via the registered process handler", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+            });
+
+            const err = new Error("boom from node");
+            (m as any).nodeExceptionHandler(err);
+            m.flush();
+
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            const event = JSON.parse((mockFetch.mock.calls[0][1].body as string).split("\n")[0]);
+            expect(event.name).toBe("client.error.uncaught");
+            expect(event.level).toBe("error");
+            expect(event.data.message).toBe("boom from node");
+            m.shutdown();
+        });
+
+        it("captures unhandledRejection via the registered process handler", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+            });
+
+            (m as any).nodeRejectionHandler(new Error("rejected in node"));
+            m.flush();
+
+            const event = JSON.parse((mockFetch.mock.calls[0][1].body as string).split("\n")[0]);
+            expect(event.name).toBe("client.error.unhandled_rejection");
+            expect(event.data.message).toBe("rejected in node");
+            m.shutdown();
+        });
+
+        it("omits path for Node handlers, which have no location", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+            });
+
+            (m as any).nodeExceptionHandler(new Error("server-side boom"));
+            m.flush();
+
+            const event = JSON.parse((mockFetch.mock.calls[0][1].body as string).split("\n")[0]);
+            expect(event.data.path).toBeUndefined();
+            m.shutdown();
+        });
+
+        it("registers a real process listener that emits on emitted events", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+            });
+
+            // Emit a genuine Node process event; the installed handler should catch it.
+            const nodeProcess = (globalThis as any).process as {
+                emit(event: string, ...args: unknown[]): boolean;
+                listenerCount(event: string): number;
+            };
+            nodeProcess.emit("uncaughtException", new Error("via process.emit"));
+            m.flush();
+
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            const event = JSON.parse((mockFetch.mock.calls[0][1].body as string).split("\n")[0]);
+            expect(event.name).toBe("client.error.uncaught");
+            expect(event.data.message).toBe("via process.emit");
+
+            // shutdown() must remove the process listener it installed.
+            const before = nodeProcess.listenerCount("uncaughtException");
+            m.shutdown();
+            expect(nodeProcess.listenerCount("uncaughtException")).toBe(before - 1);
+        });
+
+        it("respects ignoreErrors in the Node handler", () => {
+            const m = new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+                ignoreErrors: ["ignore me"],
+            });
+
+            (m as any).nodeExceptionHandler(new Error("ignore me please"));
+            m.flush();
+            expect(mockFetch).not.toHaveBeenCalled();
+            m.shutdown();
+        });
+    });
+
     describe("ignoreErrors", () => {
         it("drops uncaught errors matching a string pattern", () => {
             const m = new Monitor({
@@ -302,6 +426,90 @@ describe("Monitor", () => {
 
             expect(mockFetch).toHaveBeenCalledTimes(1);
             m.shutdown();
+        });
+    });
+
+    describe("path capture", () => {
+        // Regression: browser error handlers never read window.location, so every
+        // client error arrived at Monitor with an empty path and there was no way
+        // to tell which route it happened on.
+        const withLocation = (href: string, fn: () => void) => {
+            const url = new URL(href);
+            vi.stubGlobal("window", {
+                location: url,
+                addEventListener: vi.fn(),
+                removeEventListener: vi.fn(),
+            });
+            try {
+                fn();
+            } finally {
+                vi.unstubAllGlobals();
+                vi.stubGlobal("fetch", mockFetch);
+            }
+        };
+
+        const newMonitor = () =>
+            new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+                captureErrors: false,
+                captureUnhandledRejections: false,
+            });
+
+        it("records the route an uncaught error happened on", () => {
+            withLocation("https://trailblaze.to/blog/some-post", () => {
+                const m = newMonitor();
+                (m as any).errorHandler({
+                    message: "boom",
+                    filename: "app.js",
+                    lineno: 1,
+                    colno: 1,
+                    error: { stack: "Error: boom" },
+                });
+                m.flush();
+
+                const event = JSON.parse(
+                    (mockFetch.mock.calls[0][1].body as string).split("\n")[0],
+                );
+                expect(event.data.path).toBe("/blog/some-post");
+                m.shutdown();
+            });
+        });
+
+        it("records the route an unhandled rejection happened on", () => {
+            withLocation("https://trailblaze.to/terms", () => {
+                const m = newMonitor();
+                (m as any).rejectionHandler({ reason: new Error("nope") });
+                m.flush();
+
+                const event = JSON.parse(
+                    (mockFetch.mock.calls[0][1].body as string).split("\n")[0],
+                );
+                expect(event.data.path).toBe("/terms");
+                m.shutdown();
+            });
+        });
+
+        it("excludes query strings and hashes, which can carry personal data", () => {
+            withLocation("https://trailblaze.to/unsubscribe?email=someone@example.com#tok", () => {
+                const m = newMonitor();
+                (m as any).errorHandler({
+                    message: "boom",
+                    filename: "app.js",
+                    lineno: 1,
+                    colno: 1,
+                    error: { stack: "Error: boom" },
+                });
+                m.flush();
+
+                const body = mockFetch.mock.calls[0][1].body as string;
+                const event = JSON.parse(body.split("\n")[0]);
+                expect(event.data.path).toBe("/unsubscribe");
+                expect(body).not.toContain("someone@example.com");
+            });
         });
     });
 });
