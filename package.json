@@ -1,6 +1,6 @@
 {
   "name": "@aidenappleby/monitor-js",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Lightweight JavaScript/TypeScript client for Monitor event ingestion",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

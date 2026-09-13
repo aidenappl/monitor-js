@@ -90,9 +90,13 @@ timer is `.unref()`'d in Node so it never keeps the process alive. Auto-capture 
 **both** environments: the browser attaches `window` `error`/`unhandledrejection`
 listeners; Node attaches `process.on("uncaughtException"/"unhandledRejection")`, emitting
 the same `client.error.uncaught` / `client.error.unhandled_rejection` events (respecting
-`ignoreErrors`). The Node handlers are non-terminating — they report and return, they do
-not call `process.exit`, so crash semantics are unchanged. `shutdown()` removes the Node
-process listeners along with the browser ones.
+`ignoreErrors`). **Crash semantics are preserved.** Any `uncaughtException` listener stops
+Node from exiting, so when the SDK is the *only* listener (`isSoleListener`) it reports, prints
+the error, flushes, and exits 1 after `NODE_CRASH_GRACE_MS` (1.5s). A rejection with no other
+`unhandledRejection` listener is re-raised via `reraise()` as an uncaught exception — Node's
+default — and is not reported a second time (`reportedRejections`). When the app has its own
+listener, the SDK only reports. `shutdown()` removes the Node process listeners along with the
+browser ones.
 
 **Browser errors carry `data.path`.** Both browser handlers record
 `window.location.pathname` — `pathname` only, never `search` or `hash`. Two reasons,
@@ -213,6 +217,11 @@ retries hammered a failing ingest (now full-jitter backoff); loss invisible (`st
 **Fixed (2026-07-23):** B1 (fetch-absent data loss — fetch check now precedes the splice
 in `flush()`), B2 (flush timer now `.unref()`'d in Node), and B3 (Node auto-capture now
 attaches `process.on` handlers). See §5 "Runtime coverage".
+
+**Fixed (2026-09-13, 1.2.1):** the Node handlers were documented as "non-terminating", which
+meant a process running the SDK with defaults never crashed on an uncaught exception — it
+kept serving in whatever state the failure left. They now keep Node's crash semantics when
+the SDK is the only listener (see §5).
 
 Build + typecheck + tests are green (`tsc` clean, 56/56 vitest).
 

@@ -52,8 +52,15 @@ monitor.shutdown();
 Uncaught errors and unhandled rejections are captured automatically in **both** the
 browser (`window`) and Node (`process.on`) — disable with `captureErrors: false` /
 `captureUnhandledRejections: false`. Filter noise with
-`ignoreErrors: [/extension/i, "ResizeObserver"]`. The Node handlers report and return;
-they do not alter process-crash behavior.
+`ignoreErrors: [/extension/i, "ResizeObserver"]`.
+
+In Node, installing a process listener would normally stop an uncaught exception from
+crashing the process. The SDK keeps Node's behavior: when it is the **only**
+`uncaughtException` listener, it reports, prints the error, waits up to 1.5s for the batch
+to leave, and exits 1; an unhandled rejection with no other listener is re-raised as an
+uncaught exception, exactly as Node does by default. If your app has its own listener, the
+SDK only reports. Server code that manages its own crash handling (e.g. a Next.js
+`instrumentation.ts`) should pass `captureErrors: false, captureUnhandledRejections: false`.
 
 ### Correlation ids
 

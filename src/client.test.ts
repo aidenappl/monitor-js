@@ -212,6 +212,95 @@ describe("Monitor", () => {
     });
 
     describe("Node process handlers", () => {
+        // Most tests here cover reporting, with the app assumed to have a listener
+        // of its own — so no test can exit the runner or re-raise into it. The
+        // crash tests force the sole-listener case explicitly.
+        let soleListener: ReturnType<typeof vi.spyOn>;
+        beforeEach(() => {
+            soleListener = vi
+                .spyOn(Monitor.prototype as any, "isSoleListener")
+                .mockReturnValue(false);
+        });
+        afterEach(() => {
+            soleListener.mockRestore();
+        });
+
+        const nodeMonitor = () =>
+            new Monitor({
+                service: "test",
+                ingestUrl: "http://localhost/v1/events",
+                apiKey: "key",
+                batchSize: 100,
+                flushInterval: 60000,
+            });
+
+        it("exits like Node would when it is the only uncaughtException listener", () => {
+            vi.useFakeTimers();
+            soleListener.mockReturnValue(true);
+            const exit = vi.spyOn((globalThis as any).process, "exit").mockImplementation((() => undefined) as never);
+            const printed = vi.spyOn(console, "error").mockImplementation(() => undefined);
+            try {
+                const m = nodeMonitor();
+                (m as any).nodeExceptionHandler(new Error("fatal"));
+
+                // The report leaves before the exit, and the error is printed as Node would.
+                expect(mockFetch).toHaveBeenCalledTimes(1);
+                expect(printed).toHaveBeenCalled();
+                expect(exit).not.toHaveBeenCalled();
+                vi.advanceTimersByTime(1500);
+                expect(exit).toHaveBeenCalledWith(1);
+                m.shutdown();
+            } finally {
+                exit.mockRestore();
+                printed.mockRestore();
+                vi.useRealTimers();
+            }
+        });
+
+        it("only reports when the app has its own uncaughtException listener", () => {
+            vi.useFakeTimers();
+            const exit = vi.spyOn((globalThis as any).process, "exit").mockImplementation((() => undefined) as never);
+            try {
+                const m = nodeMonitor();
+                (m as any).nodeExceptionHandler(new Error("handled by the app"));
+                vi.advanceTimersByTime(5000);
+                expect(exit).not.toHaveBeenCalled();
+                m.shutdown();
+            } finally {
+                exit.mockRestore();
+                vi.useRealTimers();
+            }
+        });
+
+        it("re-raises a rejection nobody else listens for, and reports it once", () => {
+            vi.useFakeTimers();
+            soleListener.mockReturnValue(true);
+            const reraise = vi
+                .spyOn(Monitor.prototype as any, "reraise")
+                .mockImplementation(() => undefined);
+            const exit = vi.spyOn((globalThis as any).process, "exit").mockImplementation((() => undefined) as never);
+            const printed = vi.spyOn(console, "error").mockImplementation(() => undefined);
+            try {
+                const m = nodeMonitor();
+                const reason = new Error("nobody awaited this");
+                (m as any).nodeRejectionHandler(reason);
+                expect(reraise).toHaveBeenCalledWith(reason);
+
+                // Node delivers the re-raise to uncaughtException: it must not be reported twice.
+                (m as any).nodeExceptionHandler(reason);
+                const bodies = mockFetch.mock.calls.map((c) => c[1].body as string).join("\n");
+                expect(bodies.match(/"name":"client\.error\.[a-z_]+"/g)).toEqual([
+                    '"name":"client.error.unhandled_rejection"',
+                ]);
+                m.shutdown();
+            } finally {
+                reraise.mockRestore();
+                exit.mockRestore();
+                printed.mockRestore();
+                vi.useRealTimers();
+            }
+        });
+
         it("captures uncaughtException via the registered process handler", () => {
             const m = new Monitor({
                 service: "test",

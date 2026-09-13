@@ -8,6 +8,9 @@ declare const process:
     | {
           on?(event: string, listener: (...args: unknown[]) => void): void;
           removeListener?(event: string, listener: (...args: unknown[]) => void): void;
+          listenerCount?(event: string): number;
+          nextTick?(callback: () => void): void;
+          exit?(code?: number): void;
       }
     | undefined;
 
@@ -479,35 +482,84 @@ export class Monitor {
     };
 
     // --- Node process handlers ---
-    // uncaughtException/unhandledRejection are non-terminating here: we report the
-    // error and return without calling process.exit, matching the browser handlers'
-    // non-terminating behavior. Consumers keep their own crash semantics.
+    // Adding an uncaughtException or unhandledRejection listener changes what Node
+    // does. With no listener, either one prints the error and exits with code 1;
+    // with any listener, Node assumes it was handled and keeps running — in
+    // whatever state the failure left it. So when this SDK is the only listener,
+    // it reports the error and then does what Node would have done. When the app
+    // has a listener of its own, the app has already decided; the SDK only reports.
+
+    /** Grace for the final batch to leave before a Node-style crash exits. */
+    private static readonly NODE_CRASH_GRACE_MS = 1500;
+
+    /** Rejections already reported, so the re-raise below is not reported twice. */
+    private reportedRejections = new WeakSet<object>();
 
     private nodeExceptionHandler = (err: unknown): void => {
+        const alreadyReported =
+            typeof err === "object" && err !== null && this.reportedRejections.has(err);
         const e = err as { message?: string; stack?: string } | undefined;
         const message = e?.message ?? String(err);
         const stack = e?.stack;
-        if (this.shouldIgnoreError(message, stack)) return;
-        this.emit("client.error.uncaught", "error", {
-            data: {
-                message,
-                stack,
-            },
-        });
+        if (!alreadyReported && !this.shouldIgnoreError(message, stack)) {
+            this.emit("client.error.uncaught", "error", {
+                data: {
+                    message,
+                    stack,
+                },
+            });
+        }
+        if (this.isSoleListener("uncaughtException")) {
+            this.crashLikeNode(err);
+        }
     };
 
     private nodeRejectionHandler = (reason: unknown): void => {
         const r = reason as { message?: string; stack?: string } | undefined;
         const message = r?.message ?? String(reason);
         const stack = r?.stack;
-        if (this.shouldIgnoreError(message, stack)) return;
-        this.emit("client.error.unhandled_rejection", "error", {
-            data: {
-                message,
-                stack,
-            },
-        });
+        if (!this.shouldIgnoreError(message, stack)) {
+            this.emit("client.error.unhandled_rejection", "error", {
+                data: {
+                    message,
+                    stack,
+                },
+            });
+        }
+        // Node's default is to raise an unhandled rejection as an uncaught
+        // exception. This listener suppressed that, so re-raise it when nothing
+        // else listens for rejections: the app's own uncaughtException handling,
+        // or Node's crash, then applies exactly as it would without the SDK.
+        if (this.isSoleListener("unhandledRejection")) {
+            if (typeof reason === "object" && reason !== null) {
+                this.reportedRejections.add(reason);
+            }
+            this.reraise(reason);
+        }
     };
+
+    /** Hand an unhandled rejection back to Node as an uncaught exception. */
+    private reraise(reason: unknown): void {
+        process?.nextTick?.(() => {
+            throw reason;
+        });
+    }
+
+    /** True when this instance's own handler is the only listener for the event. */
+    private isSoleListener(event: "uncaughtException" | "unhandledRejection"): boolean {
+        const count = typeof process === "undefined" ? undefined : process.listenerCount;
+        if (typeof count !== "function") {
+            return false;
+        }
+        return count.call(process, event) <= 1;
+    }
+
+    /** Print the error as Node would, give the batch a moment to leave, exit 1. */
+    private crashLikeNode(err: unknown): void {
+        console.error(err);
+        this.flush();
+        setTimeout(() => process?.exit?.(1), Monitor.NODE_CRASH_GRACE_MS);
+    }
 
     private installErrorHandler(): void {
         if (typeof window !== "undefined") {
