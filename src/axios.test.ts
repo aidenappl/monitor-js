@@ -304,3 +304,31 @@ describe("attachAxiosMonitor", () => {
         });
     });
 });
+
+describe("attachAxiosMonitor URL privacy", () => {
+    it("drops the query string and fragment from reported URLs", () => {
+        mockFetch.mockClear();
+        const monitor = new Monitor({
+            service: "test-dashboard",
+            ingestUrl: "http://localhost/v1/events",
+            apiKey: "key",
+            flushInterval: 60000,
+            captureErrors: false,
+            captureUnhandledRejections: false,
+        });
+        const axios = createMockAxios();
+        attachAxiosMonitor(axios, monitor);
+
+        axios._simulateResponse({
+            status: 500,
+            headers: {},
+            data: {},
+            config: { method: "get", url: "/api/users?token=abc123&page=2#frag", metadata: { startTime: Date.now() } },
+        });
+        monitor.flush();
+
+        const event = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+        expect(event.data.url).toBe("/api/users");
+        monitor.shutdown();
+    });
+});

@@ -10,9 +10,12 @@ events (and auto-captured browser errors) as NDJSON to `monitor-core`.
 ## Overview
 
 `monitor-js` is the browser/Node SDK for Monitor, the counterpart to `go-monitor`. It
-queues and batches events, ships them to `monitor-core`'s ingest endpoint over `fetch`,
-and can auto-capture uncaught errors and unhandled promise rejections (browser and Node). It keeps
-the same wire format as the Go SDK.
+queues and batches events, ships them to a zone's ingest endpoint over `fetch`, and can
+auto-capture uncaught errors and unhandled promise rejections (browser and Node). It keeps
+the same wire format as the Go SDK — including its rules for surviving ingest's
+all-or-nothing validation: invalid ids are cleared before sending, a rejected batch is
+split until only the malformed event is dropped, and transient failures are retried with
+backoff instead of discarded.
 
 ## Install
 
@@ -27,24 +30,42 @@ import { Monitor } from "@aidenappleby/monitor-js";
 
 const monitor = new Monitor({
   service: "my-web-app",
-  ingestUrl: "https://monitor.appleby.cloud/v1/events",
-  apiKey: process.env.MONITOR_API_KEY!,   // ingest-scoped key
+  ingestUrl: "https://appleby-monitor-api.appleby.cloud/v1/events", // one zone's ingest endpoint
+  apiKey: process.env.MONITOR_API_KEY!,   // ingest-scoped key minted on that zone
   env: "production",
+  onDrop: (total) => droppedEvents.set(total), // optional: be told about loss
 });
 
 monitor.setUser("user_123");
-monitor.info("checkout.started", { data: { cartTotal: 4200 } });
-monitor.error("checkout.failed", { data: { reason: "card_declined" } });
+monitor.info("checkout.start.success", { data: { cartTotal: 4200 } });
+monitor.error("checkout.payment.failed", { data: { reason: "card_declined" } });
+
+monitor.stats(); // { enqueued, flushed, dropped, quarantined, queued }
 
 // on teardown
 monitor.shutdown();
 ```
+
+> **In a browser, `apiKey` is public** — anyone who loads the page can read it. Prefer
+> pointing `ingestUrl` at a route on your own origin that forwards to Monitor server-side.
 
 Uncaught errors and unhandled rejections are captured automatically in **both** the
 browser (`window`) and Node (`process.on`) — disable with `captureErrors: false` /
 `captureUnhandledRejections: false`. Filter noise with
 `ignoreErrors: [/extension/i, "ResizeObserver"]`. The Node handlers report and return;
 they do not alter process-crash behavior.
+
+### Correlation ids
+
+`request_id`, `trace_id` and `job_id` must be a UUID or 8–64 hex characters — anything
+else is cleared before sending and kept in `data.invalid_<field>`. Each `Monitor` mints a
+session `job_id`; mint the others with the helpers:
+
+```ts
+import { newRequestId, newTraceId, isValidCorrelationId } from "@aidenappleby/monitor-js";
+
+monitor.info("upload.start.success", { requestId: newRequestId(), traceId: newTraceId() });
+```
 
 ### Axios integration
 
@@ -56,11 +77,13 @@ const api = axios.create({ baseURL: "/api", validateStatus: () => true });
 attachAxiosMonitor(api, monitor, { ignorePaths: ["/health"] });
 ```
 
+Reported URLs have their query string removed.
+
 ## Role in the Monitor ecosystem
 
 - **`monitor-core`** — ingestion target (`POST /v1/events`, `X-Api-Key`).
-- **`go-monitor`** — the Go SDK; shares the wire format.
-- **`monitor-web`** — consumes this SDK for browser error capture.
+- **`go-monitor`** — the Go SDK; shares the wire format and delivery rules.
+- **`monitor-web`** — displays the events (it does not use this SDK).
 
 ## Development
 
@@ -75,5 +98,5 @@ Publishing to npm runs the build via `prepublishOnly` and requires 2FA.
 ## Contributing & further reading
 
 Read **[AGENTS.md](./AGENTS.md)** before working here — it documents the event pipeline,
-the exact wire contract (kept in lockstep with `go-monitor` / `monitor-core`), the
-config surface, and current known issues (notably Node-runtime caveats).
+the delivery rules, the exact wire contract (kept in lockstep with `go-monitor` /
+`monitor-core`), the config surface, and current known issues.

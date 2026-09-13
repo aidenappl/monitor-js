@@ -20,6 +20,16 @@ export interface AxiosMonitorOptions {
 }
 
 /**
+ * The request URL without its query string or fragment. Query strings are where
+ * tokens and email addresses travel in URLs, and anything reported is retained
+ * for the life of the event store.
+ */
+function stripQuery(url: string): string {
+    const i = url.search(/[?#]/);
+    return i === -1 ? url : url.slice(0, i);
+}
+
+/**
  * Attaches Monitor interceptors to an Axios instance.
  * Automatically reports API failures with request_id correlation.
  *
@@ -43,7 +53,7 @@ export function attachAxiosMonitor(
 
     axiosInstance.interceptors.response.use(
         (response: any) => {
-            const url: string = response.config?.url ?? "";
+            const url: string = stripQuery(response.config?.url ?? "");
             if (ignorePaths.some((p) => url.includes(p))) return response;
 
             const statusCode: number = response.status ?? 0;
@@ -90,7 +100,7 @@ export function attachAxiosMonitor(
             return response;
         },
         (error: any) => {
-            const url: string = error.config?.url ?? "";
+            const url: string = stripQuery(error.config?.url ?? "");
             if (ignorePaths.some((p) => url.includes(p))) {
                 return Promise.reject(error);
             }

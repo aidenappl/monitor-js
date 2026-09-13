@@ -33,11 +33,14 @@ interceptor helper. It **does not** own ingestion/storage/query (that's `monitor
 ```
 monitor-js/
   src/
-    index.ts      # Public exports: Monitor, attachAxiosMonitor, types
-    client.ts     # Monitor class — queue, batching, flush, browser auto-capture, lifecycle
-    axios.ts      # attachAxiosMonitor(instance, monitor, opts) — reports API failures
-    types.ts      # MonitorConfig, MonitorEvent, EmitOptions, LogLevel
-    *.test.ts     # vitest unit tests (35 tests)
+    index.ts          # Public exports: Monitor, attachAxiosMonitor, id helpers, types
+    client.ts         # Monitor class — queue, batching, delivery (status handling, bisection,
+                      #   backoff), browser/Node auto-capture, lifecycle
+    ids.ts            # isValidCorrelationId + newRequestId/newJobId/newTraceId
+    axios.ts          # attachAxiosMonitor(instance, monitor, opts) — reports API failures
+    types.ts          # MonitorConfig, MonitorEvent, EmitOptions, LogLevel, MonitorStats
+    delivery.test.ts  # response handling, bisection, backoff, keepalive, shrinking, ids on events
+    *.test.ts         # vitest unit tests (56 tests)
   tsup.config.ts tsconfig.json package.json
 ```
 
@@ -61,14 +64,24 @@ changes with `monitor-core` and `go-monitor`.
 ## 5. How code is written here — the pipeline
 
 ```
-new Monitor(config)         # starts flush timer + installs browser auto-capture
+new Monitor(config)         # mints a session job_id, starts the flush timer, installs auto-capture
   → monitor.info/warn/error/debug/fatal(name, {requestId, traceId, userId, data})
-  → emit(): build MonitorEvent, push to in-memory queue (cap MAX_QUEUE_SIZE=500, drops OLDEST on overflow)
-  → auto-flush when queue length ≥ batchSize; else on flushInterval timer
-  → flush(): NDJSON = batch.map(JSON.stringify).join("\n"); POST fetch(keepalive:true)
-             on failure, re-queue the batch if there's room
-Browser lifecycle: flush on visibilitychange→hidden and pagehide.
-shutdown(): clear timer, flush, remove listeners.
+  → emit(): ids monitor-core would reject → cleared, value kept in data.invalid_<field>;
+            level folded ("ERROR"→"error", "warning"→"warn"); push to the queue
+            (cap MAX_QUEUE_SIZE=500; overflow drops the OLDEST, counted)
+  → auto-flush when queue length ≥ batchSize; else on the flushInterval timer
+  → flush(): skipped while backing off after a transient failure
+  → send(): serialize each event (never throws; >1 MB lines shrunk to grouping fields);
+            POST NDJSON with keepalive only if the body is ≤ 60 KB
+  → response:
+       2xx/3xx                 → counted flushed; backoff reset
+       400/413/422/other 4xx   → split and resend until the malformed event stands alone,
+                                 then drop it (quarantined); bounded extra requests
+       401/403/404/405         → drop + count; console.warn once per instance
+       408/429/5xx/network     → requeue at the front (as room allows) + full-jitter backoff
+                                 (1s doubling to 60s)
+Browser lifecycle: flush on visibilitychange→hidden and pagehide — these, and shutdown(),
+ignore the backoff: it is the last chance those events get.
 ```
 
 **Runtime coverage.** `flush()` checks for a global `fetch` **before** dequeuing, so on a
@@ -85,7 +98,7 @@ process listeners along with the browser ones.
 `window.location.pathname` — `pathname` only, never `search` or `hash`. Two reasons,
 both binding: query strings routinely carry tokens and email addresses, and
 monitor-core folds `data.path` into the server-side **issue fingerprint**
-(`sha256(service | name | path | normalizedMessage)`), so anything put here is both
+(`sha256(project | service | name | path | normalizedMessage)`), so anything put here is both
 retained and grouped on. Adding a query string would leak personal data into issue
 identity and shatter one issue into thousands.
 
@@ -96,15 +109,25 @@ browser errors re-key when this ships. The Node handlers deliberately omit `path
 there is no location server-side.
 
 Public API: `Monitor` (`setUser`/`clearUser`/`setJobId`, `emit`, `debug`/`info`/`warn`/
-`error`/`fatal`, `flush`, `shutdown`), `attachAxiosMonitor`, and the types.
+`error`/`fatal`, `flush`, `stats`, `shutdown`), `attachAxiosMonitor`,
+`isValidCorrelationId`/`newRequestId`/`newJobId`/`newTraceId`, and the types.
+
+**Why the delivery rules look like this.** monitor-core ingest is all-or-nothing: one
+line it rejects fails the whole request. Before 1.2.0 the SDK had no `resp.ok` check, so
+a `400` resolved as success and the batch was discarded as "sent"; and it forwarded
+whatever id a caller supplied, so a single `setJobId("lattice-web-1")` would have 400'd
+every batch forever, silently. It also asked for `keepalive` on every request, so a batch
+over the browser's 64 KiB keepalive quota failed with a `TypeError` on every retry. And
+`JSON.stringify` on circular data threw out of `flush()` — and out of `emit()`, via the
+auto-flush.
 
 ### Config (types.ts)
 
 | Field | Default | Notes |
 |---|---|---|
 | `service` | — | **Required.** |
-| `ingestUrl` | — | **Required.** Full ingest endpoint (e.g. `https://monitor.appleby.cloud/v1/events`). |
-| `apiKey` | — | Sent as `X-Api-Key`. |
+| `ingestUrl` | — | **Required.** One zone's full ingest endpoint (e.g. `https://appleby-monitor-api.appleby.cloud/v1/events`). `https://monitor.appleby.cloud` is the dashboard and ingests nothing. |
+| `apiKey` | — | Sent as `X-Api-Key`. Minted on the zone `ingestUrl` points at. **Public in a browser bundle** — prefer a same-origin route that forwards server-side. |
 | `env` | `"production"` | |
 | `flushInterval` | 2000ms | |
 | `batchSize` | 20 | auto-flush threshold |
@@ -112,6 +135,7 @@ Public API: `Monitor` (`setUser`/`clearUser`/`setJobId`, `emit`, `debug`/`info`/
 | `captureUnhandledRejections` | true | browser `unhandledrejection` **or** Node `process.on("unhandledRejection")` |
 | `debug` | false | |
 | `ignoreErrors` | `[]` | string/RegExp patterns dropped before queueing (applies to auto-captured errors) |
+| `onDrop` | — | `(total) => void`, called with the running total on every loss. A throw is swallowed. |
 
 `MAX_QUEUE_SIZE` (500) is a hard cap in `client.ts` — not configurable.
 
@@ -121,15 +145,19 @@ Public API: `Monitor` (`setUser`/`clearUser`/`setJobId`, `emit`, `debug`/`info`/
 
 Must match `go-monitor` and be accepted by `monitor-core`'s `POST /v1/events`.
 
-- **Request:** `POST <ingestUrl>`, `fetch` with `keepalive: true`.
+- **Request:** `POST <ingestUrl>` with `fetch`; `keepalive: true` only when the body is
+  ≤ 60 KB (browsers share a 64 KiB keepalive budget across the page).
 - **Headers:** `Content-Type: application/x-ndjson`, `X-Api-Key: <apiKey>`.
 - **Body:** NDJSON, one event per line (`JSON.stringify` joined by `\n`). ⚠️ **No
   trailing newline** after the last line (go-monitor adds one) — harmless with
   monitor-core's line parser.
 - **Event shape** (`types.ts` `MonitorEvent`): `timestamp` (ISO), `service`, `env`,
   `job_id`, `request_id`, `trace_id`, `user_id`, `name`, `level`, `data`.
-  ⚠️ Unlike go-monitor (omitempty), monitor-js **always sends** `job_id`/`request_id`/
-  `trace_id`/`user_id` as `""` and `data` as `{}` when unset. monitor-core only requires
+  ⚠️ Unlike go-monitor (omitempty), monitor-js **always sends** `request_id`/`trace_id`/
+  `user_id` as `""` and `data` as `{}` when unset. `job_id` is a session id minted per
+  `Monitor` instance unless `setJobId` overrides it.
+- **Ids** must match monitor-core's `^(UUID|[0-9a-fA-F]{8,64})$`; an invalid one is
+  cleared before sending (see §5). Mint them with `newRequestId`/`newTraceId`/`newJobId`. monitor-core only requires
   `timestamp`/`service`/`name`, so this is accepted — but the two SDKs emit different
   bytes for the same logical event. Keep this in mind when comparing SDK output.
 - **Levels:** `debug`/`info`/`warn`/`error`/`fatal`.
@@ -142,7 +170,8 @@ Must match `go-monitor` and be accepted by `monitor-core`'s `POST /v1/events`.
 |---|---|
 | `monitor-core` | Ingestion target — `POST /v1/events` + `IngestAuthMiddleware` (reads `X-Api-Key`). §6 is the contract. |
 | `go-monitor` | The Go SDK. Keep the wire format in lockstep (see its AGENTS §6). |
-| `monitor-web` | Uses this SDK for browser-side error capture. |
+| `monitor-web` | Displays the events. It does **not** use this SDK (earlier revisions said it did). |
+| Trailblaze `team-dashboard`, `website` | Consumers (Pages Router, direct browser POST with a `NEXT_PUBLIC_` key). |
 
 ---
 
@@ -154,7 +183,8 @@ then on responses/errors emits `api.request.server_error` (≥500), `api.request
 `api.request.success`. Correlates via the `x-request-id` response header. Works with both
 default Axios throw-on-non-2xx and `validateStatus: () => true`. Options: `minStatus`,
 `reportSuccess`, `ignorePaths`. It reads `data.error`/`data.error_message` off responses —
-a generic guess, not tied to monitor-core's `{message}` envelope.
+a generic guess, not tied to monitor-core's `{message}` envelope. The reported `url` has
+its query string and fragment removed: that is where tokens and emails travel.
 
 ---
 
@@ -170,12 +200,21 @@ a generic guess, not tied to monitor-core's `{message}` envelope.
 | ID | Sev | Where | Issue |
 |---|---|---|---|
 | — | 🟢 | §6 | Wire inconsistency vs go-monitor (empty-string fields, no trailing newline). Harmless but worth normalizing if the SDKs are meant to be byte-identical. |
+| — | 🟠 | browser | `apiKey` is readable by anyone who loads a page that embeds it. The fix is a same-origin forwarding route in the consuming app, not something the SDK can do alone. |
+| — | 🟡 | browser | No Next.js App Router integration (`instrumentation.ts`, `error.tsx`), no redaction, no source maps — minified stacks arrive minified. |
+
+**Fixed (2026-09-12, 1.2.0):** `400` treated as success (now classified, and malformed
+events isolated by bisection); invalid correlation ids sent as-is (now cleared, value kept);
+no id generator (added, plus a per-instance session `job_id`); keepalive requested on bodies
+over the browser quota (now only ≤ 60 KB); `emit()` could throw on circular data (never now);
+retries hammered a failing ingest (now full-jitter backoff); loss invisible (`stats()` and
+`onDrop`); axios `url` carried query strings (stripped).
 
 **Fixed (2026-07-23):** B1 (fetch-absent data loss — fetch check now precedes the splice
 in `flush()`), B2 (flush timer now `.unref()`'d in Node), and B3 (Node auto-capture now
 attaches `process.on` handlers). See §5 "Runtime coverage".
 
-Build + typecheck + tests are green (`tsc` clean, 35/35 vitest).
+Build + typecheck + tests are green (`tsc` clean, 56/56 vitest).
 
 ---
 

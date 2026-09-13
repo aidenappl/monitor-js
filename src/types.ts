@@ -3,9 +3,13 @@ export type LogLevel = "debug" | "info" | "warn" | "error" | "fatal";
 export interface MonitorConfig {
     /** Service name reported with every event */
     service: string;
-    /** Monitor ingest URL (e.g. https://monitor-ingest.appleby.cloud/v1/events) */
+    /** Full ingest endpoint of one zone (e.g. https://appleby-monitor-api.appleby.cloud/v1/events) */
     ingestUrl: string;
-    /** API key for authentication */
+    /**
+     * Ingest-scoped API key, minted on the zone ingestUrl points at. In a
+     * browser bundle this value is public — anyone who loads the page can read
+     * it — so prefer posting to a same-origin route that forwards server-side.
+     */
     apiKey: string;
     /** Environment name (default: "production") */
     env?: string;
@@ -27,6 +31,12 @@ export interface MonitorConfig {
      * and `client.error.unhandled_rejection`. Default: [] (no filtering).
      */
     ignoreErrors?: (string | RegExp)[];
+    /**
+     * Called with the running total whenever events are lost: queue overflow,
+     * data that cannot be serialized, events ingest rejected as malformed, or a
+     * refused API key. Keep it cheap — bump a counter. A throw is swallowed.
+     */
+    onDrop?: (total: number) => void;
 }
 
 export interface MonitorEvent {
@@ -51,4 +61,18 @@ export interface EmitOptions {
     userId?: string;
     /** Arbitrary data payload */
     data?: Record<string, unknown>;
+}
+
+/** Lifetime counters for one Monitor instance. */
+export interface MonitorStats {
+    /** Events accepted into the queue. */
+    enqueued: number;
+    /** Events the ingest endpoint accepted. */
+    flushed: number;
+    /** Events lost for good: overflow, unserializable, malformed, or refused credentials. */
+    dropped: number;
+    /** The part of `dropped` ingest refused as malformed even when sent alone. */
+    quarantined: number;
+    /** Events currently waiting in the queue. */
+    queued: number;
 }

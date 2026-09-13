@@ -172,13 +172,13 @@ describe("Monitor", () => {
     });
 
     it("persists job_id across events via setJobId", () => {
-        monitor.setJobId("job-uuid-123");
+        monitor.setJobId("0123456789abcdef");
         monitor.info("event.one");
         monitor.flush();
 
         const body = mockFetch.mock.calls[0][1].body as string;
         const event = JSON.parse(body);
-        expect(event.job_id).toBe("job-uuid-123");
+        expect(event.job_id).toBe("0123456789abcdef");
     });
 
     it("allows per-event userId override", () => {
