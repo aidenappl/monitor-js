@@ -30,6 +30,30 @@ function stripQuery(url: string): string {
 }
 
 /**
+ * A header's value by case-insensitive name, or "" when absent. Works on a
+ * plain object (the headers a caller passed, or a Node response) and on
+ * axios's AxiosHeaders, whose entries are its own enumerable properties.
+ */
+function headerValue(headers: unknown, name: string): string {
+    if (typeof headers !== "object" || headers === null) return "";
+    const want = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === want && typeof v === "string") return v;
+    }
+    return "";
+}
+
+/**
+ * The id to report for a request: the one the server echoed in its
+ * X-Request-ID response header, else the X-Request-ID the app sent. The request
+ * header is what lets a network error (no response at all) still be joined to
+ * the server's own log of the request, when the request reached it.
+ */
+function requestIdOf(config: any, response?: any): string {
+    return headerValue(response?.headers, "x-request-id") || headerValue(config?.headers, "x-request-id");
+}
+
+/**
  * Attaches Monitor interceptors to an Axios instance.
  * Automatically reports API failures with request_id correlation.
  *
@@ -45,9 +69,9 @@ export function attachAxiosMonitor(
     const reportSuccess = opts?.reportSuccess ?? false;
     const ignorePaths = opts?.ignorePaths ?? [];
 
-    // Stamp request start time
+    // Stamp request start time, keeping anything else the app put on metadata.
     axiosInstance.interceptors.request.use((config: any) => {
-        config.metadata = { startTime: Date.now() };
+        config.metadata = { ...config.metadata, startTime: Date.now() };
         return config;
     });
 
@@ -57,7 +81,7 @@ export function attachAxiosMonitor(
             if (ignorePaths.some((p) => url.includes(p))) return response;
 
             const statusCode: number = response.status ?? 0;
-            const requestId: string = response.headers?.["x-request-id"] ?? "";
+            const requestId = requestIdOf(response.config, response);
             const durationMs = response.config?.metadata?.startTime
                 ? Date.now() - response.config.metadata.startTime
                 : undefined;
@@ -112,6 +136,7 @@ export function attachAxiosMonitor(
             // Network errors (no response — timeout, DNS failure, CORS blocked)
             if (!error.response) {
                 monitor.error("api.request.network_error", {
+                    requestId: requestIdOf(error.config),
                     data: {
                         method: (error.config?.method ?? "").toUpperCase(),
                         url,
@@ -125,7 +150,7 @@ export function attachAxiosMonitor(
 
             // HTTP errors (when validateStatus is default — throws on non-2xx)
             const statusCode: number = error.response.status ?? 0;
-            const requestId: string = error.response.headers?.["x-request-id"] ?? "";
+            const requestId = requestIdOf(error.config, error.response);
 
             if (statusCode >= minStatus) {
                 const level: LogLevel = statusCode >= 500 ? "error" : "warn";
