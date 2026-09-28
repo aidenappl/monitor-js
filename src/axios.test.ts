@@ -332,3 +332,109 @@ describe("attachAxiosMonitor URL privacy", () => {
         monitor.shutdown();
     });
 });
+
+describe("attachAxiosMonitor request id from the request", () => {
+    let monitor: Monitor;
+    let axios: ReturnType<typeof createMockAxios>;
+    const sent = "3f2b8c1e-9d4a-4e6b-8f7c-1a2b3c4d5e6f";
+    const echoed = "8c1bcd3e-57dc-407b-9595-b2a98851d9a4";
+
+    const lastEvent = () => {
+        monitor.flush();
+        return JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    };
+
+    beforeEach(() => {
+        mockFetch.mockClear();
+        monitor = new Monitor({
+            service: "test-dashboard",
+            ingestUrl: "http://localhost/v1/events",
+            apiKey: "key",
+            flushInterval: 60000,
+            captureErrors: false,
+            captureUnhandledRejections: false,
+        });
+        axios = createMockAxios();
+        attachAxiosMonitor(axios, monitor);
+    });
+
+    afterEach(() => {
+        monitor.shutdown();
+    });
+
+    it("puts the sent X-Request-ID on a network error", async () => {
+        const error = {
+            config: { method: "get", url: "/api/data", headers: { "X-Request-ID": sent } },
+            code: "ECONNABORTED",
+            message: "timeout of 10000ms exceeded",
+        };
+        await expect(axios._simulateError(error)).rejects.toBe(error);
+        const event = lastEvent();
+        expect(event.name).toBe("api.request.network_error");
+        expect(event.request_id).toBe(sent);
+    });
+
+    it("matches the request header case-insensitively", async () => {
+        const error = {
+            config: { method: "get", url: "/api/data", headers: { "x-request-id": sent } },
+            code: "ERR_NETWORK",
+            message: "Network Error",
+        };
+        await expect(axios._simulateError(error)).rejects.toBe(error);
+        expect(lastEvent().request_id).toBe(sent);
+    });
+
+    it("reads an AxiosHeaders-like object whose entries are own properties", async () => {
+        class HeadersLike {
+            [k: string]: unknown;
+            constructor(init: Record<string, string>) {
+                Object.assign(this, init);
+            }
+            get(): string {
+                return "not-used";
+            }
+        }
+        const error = {
+            config: { method: "get", url: "/api/data", headers: new HeadersLike({ "X-Request-ID": sent }) },
+            code: "ERR_NETWORK",
+            message: "Network Error",
+        };
+        await expect(axios._simulateError(error)).rejects.toBe(error);
+        expect(lastEvent().request_id).toBe(sent);
+    });
+
+    it("falls back to the sent id when the response does not echo one", () => {
+        axios._simulateResponse({
+            status: 500,
+            headers: {},
+            data: {},
+            config: { method: "get", url: "/api/data", headers: { "X-Request-ID": sent } },
+        });
+        expect(lastEvent().request_id).toBe(sent);
+    });
+
+    it("prefers the id the server echoed", () => {
+        axios._simulateResponse({
+            status: 400,
+            headers: { "x-request-id": echoed },
+            data: {},
+            config: { method: "post", url: "/api/data", headers: { "X-Request-ID": sent } },
+        });
+        expect(lastEvent().request_id).toBe(echoed);
+    });
+
+    it("prefers the echoed id on the rejected path too", async () => {
+        const error = {
+            config: { method: "get", url: "/api/data", headers: { "X-Request-ID": sent } },
+            response: { status: 503, headers: { "X-Request-ID": echoed }, data: {} },
+        };
+        await expect(axios._simulateError(error)).rejects.toBe(error);
+        expect(lastEvent().request_id).toBe(echoed);
+    });
+
+    it("keeps metadata the app set when stamping the start time", () => {
+        const config = axios._simulateRequest({ url: "/test", metadata: { attempt: 2 } });
+        expect(config.metadata.attempt).toBe(2);
+        expect(config.metadata.startTime).toBeTypeOf("number");
+    });
+});

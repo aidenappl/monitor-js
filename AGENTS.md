@@ -40,7 +40,7 @@ monitor-js/
     axios.ts          # attachAxiosMonitor(instance, monitor, opts) — reports API failures
     types.ts          # MonitorConfig, MonitorEvent, EmitOptions, LogLevel, MonitorStats
     delivery.test.ts  # response handling, bisection, backoff, keepalive, shrinking, ids on events
-    *.test.ts         # vitest unit tests (56 tests)
+    *.test.ts         # vitest unit tests (66 tests)
   tsup.config.ts tsconfig.json package.json
 ```
 
@@ -184,7 +184,9 @@ Must match `go-monitor` and be accepted by `monitor-core`'s `POST /v1/events`.
 Generic Axios failure reporter (not monitor-core-specific): stamps request start time,
 then on responses/errors emits `api.request.server_error` (≥500), `api.request.client_error`
 (≥`minStatus`, default 400), `api.request.network_error` (no response), and optionally
-`api.request.success`. Correlates via the `x-request-id` response header. Works with both
+`api.request.success`. Correlates via the `x-request-id` response header, falling back to the
+`X-Request-ID` the app sent on the request (matched case-insensitively) — so a network error,
+which has no response, still carries the id when the app sets one. Works with both
 default Axios throw-on-non-2xx and `validateStatus: () => true`. Options: `minStatus`,
 `reportSuccess`, `ignorePaths`. It reads `data.error`/`data.error_message` off responses —
 a generic guess, not tied to monitor-core's `{message}` envelope. The reported `url` has
